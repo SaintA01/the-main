@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { pool, initDB } = require('./database');
+const { Pool } = require('pg');
 require('dotenv').config();
 
 const app = express();
@@ -11,21 +11,72 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-here';
+// Database connection
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
 
-// Initialize database
-initDB();
+const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret-key';
+
+// Initialize database tables
+const initDB = async () => {
+  try {
+    console.log('🔄 Initializing database tables...');
+    
+    // Users table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        email VARCHAR(100) UNIQUE NOT NULL,
+        phone VARCHAR(20) NOT NULL,
+        password VARCHAR(255) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Wallets table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS wallets (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id),
+        balance DECIMAL(10,2) DEFAULT 10000.00,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Transactions table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS transactions (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id),
+        type VARCHAR(50) NOT NULL,
+        network VARCHAR(50),
+        phone VARCHAR(20),
+        plan VARCHAR(100),
+        amount DECIMAL(10,2) NOT NULL,
+        status VARCHAR(50) DEFAULT 'success',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    console.log('✅ Database tables initialized successfully');
+  } catch (error) {
+    console.error('❌ Database initialization error:', error.message);
+  }
+};
 
 // Auth Middleware
 const authenticateToken = async (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-
-  if (!token) {
-    return res.status(401).json({ message: 'Access token required' });
-  }
-
   try {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+
+    if (!token) {
+      return res.status(401).json({ message: 'Access token required' });
+    }
+
     const decoded = jwt.verify(token, JWT_SECRET);
     const userResult = await pool.query(
       'SELECT id, name, email, phone FROM users WHERE id = $1',
@@ -43,7 +94,15 @@ const authenticateToken = async (req, res, next) => {
   }
 };
 
-// Routes
+// Health check route
+app.get('/', (req, res) => {
+  res.json({ 
+    message: '🚀 QuickTop Backend is Running!',
+    status: 'OK',
+    timestamp: new Date().toISOString()
+  });
+});
+
 app.get('/api', (req, res) => {
   res.json({ 
     message: 'QuickTop API is running with PostgreSQL!',
@@ -52,7 +111,7 @@ app.get('/api', (req, res) => {
   });
 });
 
-// Signup
+// Signup endpoint
 app.post('/api/auth/signup', async (req, res) => {
   try {
     const { name, email, phone, password } = req.body;
@@ -107,7 +166,7 @@ app.post('/api/auth/signup', async (req, res) => {
   }
 });
 
-// Login
+// Login endpoint
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -178,147 +237,43 @@ app.get('/api/wallet/balance', authenticateToken, async (req, res) => {
   }
 });
 
-// Buy Airtime
-app.post('/api/services/airtime', authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  
+// Test route (remove in production)
+app.get('/api/test-db', async (req, res) => {
   try {
-    await client.query('BEGIN');
-    const { network, phone, amount } = req.body;
-
-    if (!network || !phone || !amount) {
-      return res.status(400).json({ message: 'Network, phone, and amount are required' });
-    }
-
-    const numericAmount = parseFloat(amount);
-    if (isNaN(numericAmount) || numericAmount <= 0) {
-      return res.status(400).json({ message: 'Invalid amount' });
-    }
-
-    // Check balance
-    const balanceResult = await client.query(
-      'SELECT balance FROM wallets WHERE user_id = $1 FOR UPDATE',
-      [req.user.id]
-    );
-
-    const currentBalance = parseFloat(balanceResult.rows[0]?.balance || 0);
-    
-    if (currentBalance < numericAmount) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ message: 'Insufficient balance' });
-    }
-
-    // Update balance
-    const newBalance = currentBalance - numericAmount;
-    await client.query(
-      'UPDATE wallets SET balance = $1 WHERE user_id = $2',
-      [newBalance, req.user.id]
-    );
-
-    // Record transaction
-    const transactionResult = await client.query(
-      `INSERT INTO transactions (user_id, type, network, phone, amount) 
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [req.user.id, 'airtime', network, phone, numericAmount]
-    );
-
-    await client.query('COMMIT');
-
-    res.json({
-      message: `Airtime purchase successful! ${numericAmount} Naira ${network} airtime sent to ${phone}`,
-      transaction: transactionResult.rows[0],
-      newBalance
+    const result = await pool.query('SELECT NOW() as current_time');
+    res.json({ 
+      message: 'Database connection successful!',
+      currentTime: result.rows[0].current_time
     });
-
   } catch (error) {
-    await client.query('ROLLBACK');
-    console.error('Airtime purchase error:', error);
-    res.status(500).json({ message: 'Internal server error' });
-  } finally {
-    client.release();
-  }
-});
-
-// Buy Data
-app.post('/api/services/data', authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  
-  try {
-    await client.query('BEGIN');
-    const { network, phone, plan, amount } = req.body;
-
-    if (!network || !phone || !plan || !amount) {
-      return res.status(400).json({ message: 'Network, phone, plan, and amount are required' });
-    }
-
-    const numericAmount = parseFloat(amount);
-    if (isNaN(numericAmount) || numericAmount <= 0) {
-      return res.status(400).json({ message: 'Invalid amount' });
-    }
-
-    // Check balance
-    const balanceResult = await client.query(
-      'SELECT balance FROM wallets WHERE user_id = $1 FOR UPDATE',
-      [req.user.id]
-    );
-
-    const currentBalance = parseFloat(balanceResult.rows[0]?.balance || 0);
-    
-    if (currentBalance < numericAmount) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ message: 'Insufficient balance' });
-    }
-
-    // Update balance
-    const newBalance = currentBalance - numericAmount;
-    await client.query(
-      'UPDATE wallets SET balance = $1 WHERE user_id = $2',
-      [newBalance, req.user.id]
-    );
-
-    // Record transaction
-    const transactionResult = await client.query(
-      `INSERT INTO transactions (user_id, type, network, phone, plan, amount) 
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [req.user.id, 'data', network, phone, plan, numericAmount]
-    );
-
-    await client.query('COMMIT');
-
-    res.json({
-      message: `Data purchase successful! ${plan} ${network} data sent to ${phone}`,
-      transaction: transactionResult.rows[0],
-      newBalance
+    res.status(500).json({ 
+      message: 'Database connection failed',
+      error: error.message 
     });
-
-  } catch (error) {
-    await client.query('ROLLBACK');
-    console.error('Data purchase error:', error);
-    res.status(500).json({ message: 'Internal server error' });
-  } finally {
-    client.release();
   }
 });
 
-// Get transactions
-app.get('/api/transactions', authenticateToken, async (req, res) => {
+// Initialize and start server
+const startServer = async () => {
   try {
-    const transactionsResult = await pool.query(
-      `SELECT * FROM transactions 
-       WHERE user_id = $1 
-       ORDER BY created_at DESC 
-       LIMIT 10`,
-      [req.user.id]
-    );
-
-    res.json({ transactions: transactionsResult.rows });
+    // Test database connection
+    await pool.query('SELECT 1');
+    console.log('✅ Database connected successfully');
+    
+    // Initialize tables
+    await initDB();
+    
+    const PORT = process.env.PORT || 3000;
+    app.listen(PORT, () => {
+      console.log(`🚀 QuickTop backend running on port ${PORT}`);
+      console.log(`📱 API available at: http://localhost:${PORT}`);
+    });
   } catch (error) {
-    console.error('Get transactions error:', error);
-    res.status(500).json({ message: 'Internal server error' });
+    console.error('❌ Failed to start server:', error.message);
+    process.exit(1);
   }
-});
+};
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 QuickTop PostgreSQL backend running on port ${PORT}`);
-});
+startServer();
+
+module.exports = app;
