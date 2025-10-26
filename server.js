@@ -9,138 +9,166 @@ require('dotenv').config();
 
 const app = express();
 
-// PostgreSQL connection pool with enhanced configuration
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
-});
-
-// Test database connection
-const testConnection = async () => {
-  try {
-    const client = await pool.connect();
-    console.log('✅ PostgreSQL connected successfully');
-    
-    // Test basic query
-    const result = await client.query('SELECT NOW()');
-    console.log('📊 Database time:', result.rows[0].now);
-    
-    client.release();
-  } catch (err) {
-    console.error('❌ Database connection failed:', err.message);
-    console.log('💡 Make sure your DATABASE_URL is correctly set in environment variables');
-  }
-};
-
-testConnection();
-
-// Enhanced middleware
-app.use(helmet({
-  crossOriginResourcePolicy: { policy: "cross-origin" }
-}));
-
+// Middleware - MUST COME FIRST
+app.use(helmet());
 app.use(cors({
   origin: '*',
-  methods: ['GET', 'POST', 'PUT', 'DELETE'],
-  credentials: true
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept']
 }));
 
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // Rate limiting
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
-  message: {
-    success: false,
-    message: 'Too many requests from this IP, please try again later.'
-  }
+  windowMs: 15 * 60 * 1000,
+  max: 100
 });
 app.use(limiter);
 
-// JWT middleware
-const authenticateToken = async (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
+// PostgreSQL connection
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+});
 
-  if (!token) {
-    return res.status(401).json({ 
-      success: false, 
-      message: 'Access token required' 
+// Test database connection
+pool.on('connect', () => {
+  console.log('✅ PostgreSQL connected successfully');
+});
+
+pool.on('error', (err) => {
+  console.error('❌ PostgreSQL connection error:', err);
+});
+
+// Simple test route - ADD THIS TO VERIFY SERVER IS RUNNING
+app.get('/', (req, res) => {
+  res.json({
+    success: true,
+    message: '🚀 QuickTop Backend API is running!',
+    timestamp: new Date().toISOString(),
+    endpoints: {
+      health: '/api/health',
+      signup: '/api/auth/signup',
+      login: '/api/auth/login',
+      profile: '/api/auth/me',
+      balance: '/api/wallet/balance',
+      airtime: '/api/services/airtime',
+      data: '/api/services/data'
+    }
+  });
+});
+
+// Health check endpoint
+app.get('/api/health', async (req, res) => {
+  try {
+    // Test database connection
+    await pool.query('SELECT NOW()');
+    res.json({
+      success: true,
+      message: '✅ API is healthy',
+      database: 'connected',
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: '❌ API is unhealthy',
+      database: 'disconnected',
+      error: error.message
     });
   }
+});
 
+// Initialize database tables
+const initializeDatabase = async () => {
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    console.log('🔄 Initializing database tables...');
     
-    // Get user from database
+    // Create users table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        email VARCHAR(100) UNIQUE NOT NULL,
+        phone VARCHAR(20) UNIQUE NOT NULL,
+        password VARCHAR(255) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create wallets table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS wallets (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        balance DECIMAL(12,2) DEFAULT 5000.00,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id)
+      )
+    `);
+
+    // Create transactions table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS transactions (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        type VARCHAR(20) NOT NULL,
+        service_type VARCHAR(50) NOT NULL,
+        amount DECIMAL(12,2) NOT NULL,
+        details JSONB,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    console.log('✅ Database tables initialized successfully!');
+  } catch (error) {
+    console.error('❌ Database initialization failed:', error);
+  }
+};
+
+// Authentication middleware
+const authenticateToken = async (req, res, next) => {
+  try {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        message: 'Access token required'
+      });
+    }
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback-secret');
+    
     const userResult = await pool.query(
       'SELECT id, name, email, phone, created_at FROM users WHERE id = $1',
       [decoded.userId]
     );
     
     if (userResult.rows.length === 0) {
-      return res.status(401).json({ 
-        success: false, 
-        message: 'User not found' 
+      return res.status(401).json({
+        success: false,
+        message: 'User not found'
       });
     }
     
     req.user = userResult.rows[0];
     next();
   } catch (error) {
-    console.error('JWT verification error:', error);
-    return res.status(403).json({ 
-      success: false, 
-      message: 'Invalid or expired token' 
+    return res.status(403).json({
+      success: false,
+      message: 'Invalid or expired token'
     });
   }
 };
 
-// Health check endpoint
-app.get('/api/health', async (req, res) => {
-  try {
-    // Test database connection
-    await pool.query('SELECT 1');
-    
-    res.json({ 
-      success: true, 
-      message: 'QuickTop API is running!', 
-      timestamp: new Date().toISOString(),
-      database: 'connected',
-      environment: process.env.NODE_ENV || 'development'
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Service unhealthy - database connection failed',
-      timestamp: new Date().toISOString(),
-      database: 'disconnected'
-    });
-  }
-});
-
-// Root endpoint
-app.get('/', (req, res) => {
-  res.json({
-    success: true,
-    message: 'Welcome to QuickTop Backend API',
-    version: '1.0.0',
-    endpoints: {
-      auth: '/api/auth/*',
-      services: '/api/services/*',
-      wallet: '/api/wallet/*',
-      health: '/api/health'
-    }
-  });
-});
-
-// Signup endpoint
+// SIGNUP ENDPOINT - FIXED
 app.post('/api/auth/signup', async (req, res) => {
+  console.log('📝 Signup request received:', req.body);
+  
   try {
     const { name, email, phone, password } = req.body;
 
@@ -159,21 +187,7 @@ app.post('/api/auth/signup', async (req, res) => {
       });
     }
 
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Please provide a valid email address'
-      });
-    }
-
-    if (!/^(080|081|070|090|091)\d{8}$/.test(phone)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Please provide a valid Nigerian phone number'
-      });
-    }
-
-    // Check if user already exists
+    // Check if user exists
     const existingUser = await pool.query(
       'SELECT id FROM users WHERE email = $1 OR phone = $2',
       [email, phone]
@@ -187,32 +201,33 @@ app.post('/api/auth/signup', async (req, res) => {
     }
 
     // Hash password
-    const saltRounds = 12;
-    const hashedPassword = await bcrypt.hash(password, saltRounds);
+    const hashedPassword = await bcrypt.hash(password, 12);
 
     // Create user
-    const result = await pool.query(
+    const userResult = await pool.query(
       `INSERT INTO users (name, email, phone, password) 
        VALUES ($1, $2, $3, $4) 
        RETURNING id, name, email, phone, created_at`,
       [name, email, phone, hashedPassword]
     );
 
-    const user = result.rows[0];
+    const user = userResult.rows[0];
 
-    // Create wallet for user with initial balance
+    // Create wallet
     await pool.query(
       'INSERT INTO wallets (user_id, balance) VALUES ($1, $2)',
-      [user.id, 5000] // Initial balance for demo
+      [user.id, 5000]
     );
 
-    // Generate JWT token
+    // Generate token
     const token = jwt.sign(
-      { userId: user.id }, 
-      process.env.JWT_SECRET || 'fallback-secret-key-change-in-production', 
-      { expiresIn: process.env.JWT_EXPIRES_IN || '30d' }
+      { userId: user.id },
+      process.env.JWT_SECRET || 'fallback-secret',
+      { expiresIn: '30d' }
     );
 
+    console.log('✅ User created successfully:', user.email);
+    
     res.status(201).json({
       success: true,
       message: 'User created successfully',
@@ -226,7 +241,7 @@ app.post('/api/auth/signup', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Signup error:', error);
+    console.error('❌ Signup error:', error);
     res.status(500).json({
       success: false,
       message: 'Internal server error during registration'
@@ -234,12 +249,13 @@ app.post('/api/auth/signup', async (req, res) => {
   }
 });
 
-// Login endpoint
+// LOGIN ENDPOINT
 app.post('/api/auth/login', async (req, res) => {
+  console.log('🔐 Login request received:', req.body.email);
+  
   try {
     const { email, password } = req.body;
 
-    // Validation
     if (!email || !password) {
       return res.status(400).json({
         success: false,
@@ -248,19 +264,19 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     // Find user
-    const result = await pool.query(
+    const userResult = await pool.query(
       'SELECT * FROM users WHERE email = $1',
       [email]
     );
 
-    if (result.rows.length === 0) {
+    if (userResult.rows.length === 0) {
       return res.status(401).json({
         success: false,
         message: 'Invalid email or password'
       });
     }
 
-    const user = result.rows[0];
+    const user = userResult.rows[0];
 
     // Check password
     const isPasswordValid = await bcrypt.compare(password, user.password);
@@ -271,13 +287,15 @@ app.post('/api/auth/login', async (req, res) => {
       });
     }
 
-    // Generate JWT token
+    // Generate token
     const token = jwt.sign(
-      { userId: user.id }, 
-      process.env.JWT_SECRET || 'fallback-secret-key-change-in-production',
-      { expiresIn: process.env.JWT_EXPIRES_IN || '30d' }
+      { userId: user.id },
+      process.env.JWT_SECRET || 'fallback-secret',
+      { expiresIn: '30d' }
     );
 
+    console.log('✅ Login successful:', user.email);
+    
     res.json({
       success: true,
       message: 'Login successful',
@@ -291,7 +309,7 @@ app.post('/api/auth/login', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Login error:', error);
+    console.error('❌ Login error:', error);
     res.status(500).json({
       success: false,
       message: 'Internal server error during login'
@@ -299,7 +317,7 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// Get current user profile
+// PROFILE ENDPOINT
 app.get('/api/auth/me', authenticateToken, async (req, res) => {
   try {
     res.json({
@@ -315,7 +333,7 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
   }
 });
 
-// Get wallet balance
+// WALLET BALANCE ENDPOINT
 app.get('/api/wallet/balance', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -323,16 +341,9 @@ app.get('/api/wallet/balance', authenticateToken, async (req, res) => {
       [req.user.id]
     );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Wallet not found'
-      });
-    }
-
     res.json({
       success: true,
-      balance: parseFloat(result.rows[0].balance)
+      balance: parseFloat(result.rows[0]?.balance || 0)
     });
 
   } catch (error) {
@@ -344,7 +355,7 @@ app.get('/api/wallet/balance', authenticateToken, async (req, res) => {
   }
 });
 
-// Fund wallet endpoint
+// FUND WALLET ENDPOINT
 app.post('/api/wallet/fund', authenticateToken, async (req, res) => {
   try {
     const { amount } = req.body;
@@ -376,12 +387,11 @@ app.post('/api/wallet/fund', authenticateToken, async (req, res) => {
   }
 });
 
-// Airtime purchase endpoint
+// AIRTIME PURCHASE ENDPOINT
 app.post('/api/services/airtime', authenticateToken, async (req, res) => {
   try {
     const { network, phone, amount } = req.body;
 
-    // Validation
     if (!network || !phone || !amount) {
       return res.status(400).json({
         success: false,
@@ -389,40 +399,13 @@ app.post('/api/services/airtime', authenticateToken, async (req, res) => {
       });
     }
 
-    if (!['mtn', 'glo', 'airtel', '9mobile'].includes(network)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid network provider'
-      });
-    }
-
-    if (!/^(080|081|070|090|091)\d{8}$/.test(phone)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid phone number'
-      });
-    }
-
     const numericAmount = parseFloat(amount);
-    if (isNaN(numericAmount) || numericAmount <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid amount'
-      });
-    }
-
-    // Check wallet balance
+    
+    // Check balance
     const walletResult = await pool.query(
       'SELECT balance FROM wallets WHERE user_id = $1',
       [req.user.id]
     );
-
-    if (walletResult.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Wallet not found'
-      });
-    }
 
     const currentBalance = parseFloat(walletResult.rows[0].balance);
     if (currentBalance < numericAmount) {
@@ -447,13 +430,7 @@ app.post('/api/services/airtime', authenticateToken, async (req, res) => {
         'debit',
         'airtime',
         numericAmount,
-        JSON.stringify({
-          network,
-          phone,
-          amount: numericAmount,
-          status: 'completed',
-          timestamp: new Date().toISOString()
-        })
+        JSON.stringify({ network, phone, amount: numericAmount, status: 'completed' })
       ]
     );
 
@@ -464,8 +441,7 @@ app.post('/api/services/airtime', authenticateToken, async (req, res) => {
         type: 'airtime',
         amount: numericAmount,
         phone: phone,
-        network: network,
-        timestamp: new Date().toISOString()
+        network: network
       }
     });
 
@@ -478,12 +454,11 @@ app.post('/api/services/airtime', authenticateToken, async (req, res) => {
   }
 });
 
-// Data purchase endpoint
+// DATA PURCHASE ENDPOINT
 app.post('/api/services/data', authenticateToken, async (req, res) => {
   try {
     const { network, phone, plan, amount } = req.body;
 
-    // Validation
     if (!network || !phone || !plan || !amount) {
       return res.status(400).json({
         success: false,
@@ -491,40 +466,13 @@ app.post('/api/services/data', authenticateToken, async (req, res) => {
       });
     }
 
-    if (!['mtn', 'glo', 'airtel', '9mobile'].includes(network)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid network provider'
-      });
-    }
-
-    if (!/^(080|081|070|090|091)\d{8}$/.test(phone)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid phone number'
-      });
-    }
-
     const numericAmount = parseFloat(amount);
-    if (isNaN(numericAmount) || numericAmount <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid amount'
-      });
-    }
-
-    // Check wallet balance
+    
+    // Check balance
     const walletResult = await pool.query(
       'SELECT balance FROM wallets WHERE user_id = $1',
       [req.user.id]
     );
-
-    if (walletResult.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Wallet not found'
-      });
-    }
 
     const currentBalance = parseFloat(walletResult.rows[0].balance);
     if (currentBalance < numericAmount) {
@@ -549,14 +497,7 @@ app.post('/api/services/data', authenticateToken, async (req, res) => {
         'debit',
         'data',
         numericAmount,
-        JSON.stringify({
-          network,
-          phone,
-          plan,
-          amount: numericAmount,
-          status: 'completed',
-          timestamp: new Date().toISOString()
-        })
+        JSON.stringify({ network, phone, plan, amount: numericAmount, status: 'completed' })
       ]
     );
 
@@ -568,8 +509,7 @@ app.post('/api/services/data', authenticateToken, async (req, res) => {
         amount: numericAmount,
         phone: phone,
         network: network,
-        plan: plan,
-        timestamp: new Date().toISOString()
+        plan: plan
       }
     });
 
@@ -582,7 +522,7 @@ app.post('/api/services/data', authenticateToken, async (req, res) => {
   }
 });
 
-// Get user transactions
+// TRANSACTIONS ENDPOINT
 app.get('/api/transactions', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -608,26 +548,41 @@ app.get('/api/transactions', authenticateToken, async (req, res) => {
   }
 });
 
-// 404 handler
+// 404 handler - MUST BE LAST
 app.use('*', (req, res) => {
+  console.log('❌ Route not found:', req.originalUrl);
   res.status(404).json({
     success: false,
-    message: 'API endpoint not found'
+    message: 'API endpoint not found',
+    requested: req.originalUrl
   });
 });
 
 // Global error handler
 app.use((error, req, res, next) => {
-  console.error('Unhandled error:', error);
+  console.error('🚨 Unhandled error:', error);
   res.status(500).json({
     success: false,
     message: 'Internal server error'
   });
 });
 
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 QuickTop Server running on port ${PORT}`);
-  console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`🔗 Health check: http://localhost:${PORT}/api/health`);
-});
+// Initialize database and start server
+const startServer = async () => {
+  try {
+    await initializeDatabase();
+    
+    const PORT = process.env.PORT || 10000;
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`🚀 QuickTop Server running on port ${PORT}`);
+      console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
+      console.log(`🔗 Base URL: http://localhost:${PORT}`);
+      console.log(`🏥 Health check: http://localhost:${PORT}/api/health`);
+    });
+  } catch (error) {
+    console.error('❌ Failed to start server:', error);
+    process.exit(1);
+  }
+};
+
+startServer();
