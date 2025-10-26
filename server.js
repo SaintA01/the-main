@@ -9,32 +9,56 @@ require('dotenv').config();
 
 const app = express();
 
-// PostgreSQL connection pool
+// PostgreSQL connection pool with enhanced configuration
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
 });
 
 // Test database connection
-pool.connect((err, client, release) => {
-  if (err) {
-    console.error('❌ Error acquiring client', err.stack);
-  } else {
+const testConnection = async () => {
+  try {
+    const client = await pool.connect();
     console.log('✅ PostgreSQL connected successfully');
-    release();
+    
+    // Test basic query
+    const result = await client.query('SELECT NOW()');
+    console.log('📊 Database time:', result.rows[0].now);
+    
+    client.release();
+  } catch (err) {
+    console.error('❌ Database connection failed:', err.message);
+    console.log('💡 Make sure your DATABASE_URL is correctly set in environment variables');
   }
-});
+};
 
-// Middleware
-app.use(helmet());
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+testConnection();
+
+// Enhanced middleware
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" }
+}));
+
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  credentials: true
+}));
+
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Rate limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100 // limit each IP to 100 requests per windowMs
+  max: 100, // limit each IP to 100 requests per windowMs
+  message: {
+    success: false,
+    message: 'Too many requests from this IP, please try again later.'
+  }
 });
 app.use(limiter);
 
@@ -69,6 +93,7 @@ const authenticateToken = async (req, res, next) => {
     req.user = userResult.rows[0];
     next();
   } catch (error) {
+    console.error('JWT verification error:', error);
     return res.status(403).json({ 
       success: false, 
       message: 'Invalid or expired token' 
@@ -76,14 +101,41 @@ const authenticateToken = async (req, res, next) => {
   }
 };
 
-// Routes
+// Health check endpoint
+app.get('/api/health', async (req, res) => {
+  try {
+    // Test database connection
+    await pool.query('SELECT 1');
+    
+    res.json({ 
+      success: true, 
+      message: 'QuickTop API is running!', 
+      timestamp: new Date().toISOString(),
+      database: 'connected',
+      environment: process.env.NODE_ENV || 'development'
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Service unhealthy - database connection failed',
+      timestamp: new Date().toISOString(),
+      database: 'disconnected'
+    });
+  }
+});
 
-// Health check
-app.get('/api/health', (req, res) => {
-  res.json({ 
-    success: true, 
-    message: 'QuickTop API is running!', 
-    timestamp: new Date().toISOString() 
+// Root endpoint
+app.get('/', (req, res) => {
+  res.json({
+    success: true,
+    message: 'Welcome to QuickTop Backend API',
+    version: '1.0.0',
+    endpoints: {
+      auth: '/api/auth/*',
+      services: '/api/services/*',
+      wallet: '/api/wallet/*',
+      health: '/api/health'
+    }
   });
 });
 
@@ -96,7 +148,7 @@ app.post('/api/auth/signup', async (req, res) => {
     if (!name || !email || !phone || !password) {
       return res.status(400).json({
         success: false,
-        message: 'All fields are required'
+        message: 'All fields are required: name, email, phone, password'
       });
     }
 
@@ -148,17 +200,17 @@ app.post('/api/auth/signup', async (req, res) => {
 
     const user = result.rows[0];
 
-    // Create wallet for user
+    // Create wallet for user with initial balance
     await pool.query(
       'INSERT INTO wallets (user_id, balance) VALUES ($1, $2)',
-      [user.id, 0]
+      [user.id, 5000] // Initial balance for demo
     );
 
     // Generate JWT token
     const token = jwt.sign(
       { userId: user.id }, 
-      process.env.JWT_SECRET, 
-      { expiresIn: process.env.JWT_EXPIRES_IN }
+      process.env.JWT_SECRET || 'fallback-secret-key-change-in-production', 
+      { expiresIn: process.env.JWT_EXPIRES_IN || '30d' }
     );
 
     res.status(201).json({
@@ -177,7 +229,7 @@ app.post('/api/auth/signup', async (req, res) => {
     console.error('Signup error:', error);
     res.status(500).json({
       success: false,
-      message: 'Internal server error'
+      message: 'Internal server error during registration'
     });
   }
 });
@@ -222,8 +274,8 @@ app.post('/api/auth/login', async (req, res) => {
     // Generate JWT token
     const token = jwt.sign(
       { userId: user.id }, 
-      process.env.JWT_SECRET, 
-      { expiresIn: process.env.JWT_EXPIRES_IN }
+      process.env.JWT_SECRET || 'fallback-secret-key-change-in-production',
+      { expiresIn: process.env.JWT_EXPIRES_IN || '30d' }
     );
 
     res.json({
@@ -242,7 +294,7 @@ app.post('/api/auth/login', async (req, res) => {
     console.error('Login error:', error);
     res.status(500).json({
       success: false,
-      message: 'Internal server error'
+      message: 'Internal server error during login'
     });
   }
 });
@@ -280,7 +332,7 @@ app.get('/api/wallet/balance', authenticateToken, async (req, res) => {
 
     res.json({
       success: true,
-      balance: result.rows[0].balance
+      balance: parseFloat(result.rows[0].balance)
     });
 
   } catch (error) {
@@ -292,7 +344,7 @@ app.get('/api/wallet/balance', authenticateToken, async (req, res) => {
   }
 });
 
-// Update wallet balance (for testing/demo)
+// Fund wallet endpoint
 app.post('/api/wallet/fund', authenticateToken, async (req, res) => {
   try {
     const { amount } = req.body;
@@ -312,7 +364,7 @@ app.post('/api/wallet/fund', authenticateToken, async (req, res) => {
     res.json({
       success: true,
       message: 'Wallet funded successfully',
-      balance: result.rows[0].balance
+      balance: parseFloat(result.rows[0].balance)
     });
 
   } catch (error) {
@@ -372,7 +424,7 @@ app.post('/api/services/airtime', authenticateToken, async (req, res) => {
       });
     }
 
-    const currentBalance = walletResult.rows[0].balance;
+    const currentBalance = parseFloat(walletResult.rows[0].balance);
     if (currentBalance < numericAmount) {
       return res.status(400).json({
         success: false,
@@ -399,7 +451,8 @@ app.post('/api/services/airtime', authenticateToken, async (req, res) => {
           network,
           phone,
           amount: numericAmount,
-          status: 'completed'
+          status: 'completed',
+          timestamp: new Date().toISOString()
         })
       ]
     );
@@ -411,7 +464,8 @@ app.post('/api/services/airtime', authenticateToken, async (req, res) => {
         type: 'airtime',
         amount: numericAmount,
         phone: phone,
-        network: network
+        network: network,
+        timestamp: new Date().toISOString()
       }
     });
 
@@ -419,7 +473,7 @@ app.post('/api/services/airtime', authenticateToken, async (req, res) => {
     console.error('Airtime purchase error:', error);
     res.status(500).json({
       success: false,
-      message: 'Internal server error'
+      message: 'Internal server error during airtime purchase'
     });
   }
 });
@@ -472,7 +526,7 @@ app.post('/api/services/data', authenticateToken, async (req, res) => {
       });
     }
 
-    const currentBalance = walletResult.rows[0].balance;
+    const currentBalance = parseFloat(walletResult.rows[0].balance);
     if (currentBalance < numericAmount) {
       return res.status(400).json({
         success: false,
@@ -500,7 +554,8 @@ app.post('/api/services/data', authenticateToken, async (req, res) => {
           phone,
           plan,
           amount: numericAmount,
-          status: 'completed'
+          status: 'completed',
+          timestamp: new Date().toISOString()
         })
       ]
     );
@@ -513,7 +568,8 @@ app.post('/api/services/data', authenticateToken, async (req, res) => {
         amount: numericAmount,
         phone: phone,
         network: network,
-        plan: plan
+        plan: plan,
+        timestamp: new Date().toISOString()
       }
     });
 
@@ -521,7 +577,7 @@ app.post('/api/services/data', authenticateToken, async (req, res) => {
     console.error('Data purchase error:', error);
     res.status(500).json({
       success: false,
-      message: 'Internal server error'
+      message: 'Internal server error during data purchase'
     });
   }
 });
@@ -560,7 +616,7 @@ app.use('*', (req, res) => {
   });
 });
 
-// Error handler
+// Global error handler
 app.use((error, req, res, next) => {
   console.error('Unhandled error:', error);
   res.status(500).json({
@@ -570,7 +626,8 @@ app.use((error, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 QuickTop Server running on port ${PORT}`);
-  console.log(`📊 Environment: ${process.env.NODE_ENV}`);
+  console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`🔗 Health check: http://localhost:${PORT}/api/health`);
 });
