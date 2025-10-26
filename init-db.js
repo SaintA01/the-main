@@ -1,4 +1,3 @@
-
 const { Pool } = require('pg');
 require('dotenv').config();
 
@@ -9,7 +8,7 @@ const pool = new Pool({
 
 const initDatabase = async () => {
   try {
-    console.log('🔄 Initializing database...');
+    console.log('🔄 Initializing QuickTop database...');
 
     // Create users table
     await pool.query(`
@@ -41,8 +40,8 @@ const initDatabase = async () => {
       CREATE TABLE IF NOT EXISTS transactions (
         id SERIAL PRIMARY KEY,
         user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        type VARCHAR(20) NOT NULL, -- debit/credit
-        service_type VARCHAR(50) NOT NULL, -- airtime/data, etc.
+        type VARCHAR(20) NOT NULL,
+        service_type VARCHAR(50) NOT NULL,
         amount DECIMAL(12,2) NOT NULL,
         details JSONB,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -60,6 +59,7 @@ const initDatabase = async () => {
     
   } catch (error) {
     console.error('❌ Database initialization failed:', error);
+    process.exit(1);
   } finally {
     await pool.end();
   }
