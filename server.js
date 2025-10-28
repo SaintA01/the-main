@@ -5,15 +5,14 @@ const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const admin = require('firebase-admin'); // 👈 NEW: For Firebase Admin SDK
-const sgMail = require('@sendgrid/mail'); // 👈 NEW: For SendGrid Email
-const fs = require('fs'); // 👈 NEW: For reading email templates
-const path = require('path'); // 👈 NEW: For path resolving
+const admin = require('firebase-admin'); // 👈 For Firebase Admin SDK
+const sgMail = require('@sendgrid/mail'); // 👈 For SendGrid Email
+const fs = require('fs'); // 👈 For reading email templates
+const path = require('path'); // 👈 For path resolving
 require('dotenv').config();
 
-// Assuming init-db.js exports a function to run the migrations/setup
-// ⚡ FIX: Renamed import to match the likely export 'initDatabase'
-const { initDatabase } = require('./init-db');
+// ⚡ FINAL FIX: Import the function directly, as it's likely the default export.
+const initDatabase = require('./init-db');
 
 const app = express();
 
@@ -54,7 +53,7 @@ pool.on('error', (err) => {
 
 // --- Firebase and SendGrid Setup ---
 
-// NEW: Firebase Admin SDK Initialization (Secure Environment Variable Method)
+// Firebase Admin SDK Initialization (Secure Environment Variable Method)
 const serviceAccountString = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
 let firebaseAdminInitialized = false;
 
@@ -76,7 +75,7 @@ if (serviceAccountString) {
   console.warn('⚠️ FIREBASE_SERVICE_ACCOUNT_JSON environment variable not set. Push notifications will be disabled.');
 }
 
-// NEW: Set SendGrid API Key and Sender
+// Set SendGrid API Key and Sender
 sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 const SENDER_EMAIL = process.env.SENDGRID_VERIFIED_SENDER || 'contact.quicktop@gmail.com';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'quicktop_admin_pass_2025!';
@@ -780,7 +779,7 @@ app.use((error, req, res, next) => {
 // Initialize database and start server
 const startServer = async () => {
   try {
-    // ⚡ FIX: Call the correct function name: initDatabase
+    // Call the imported function
     await initDatabase(pool); 
     
     const PORT = process.env.PORT || 10000;
