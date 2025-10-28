@@ -5,14 +5,14 @@ const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const admin = require('firebase-admin'); // 👈 For Firebase Admin SDK
-const sgMail = require('@sendgrid/mail'); // 👈 For SendGrid Email
-const fs = require('fs'); // 👈 For reading email templates
-const path = require('path'); // 👈 For path resolving
+const admin = require('firebase-admin'); 
+const sgMail = require('@sendgrid/mail'); 
+const fs = require('fs'); 
+const path = require('path'); 
 require('dotenv').config();
 
-// ⚡ FINAL FIX: Import the function directly, as it's likely the default export.
-const initDatabase = require('./init-db');
+// ⚡ FIX 1: Import the function via named destructuring { initDatabase }
+const { initDatabase } = require('./init-db');
 
 const app = express();
 
@@ -189,12 +189,13 @@ app.get('/', (req, res) => {
 
 // --- AUTH ROUTES ---
 app.post('/api/auth/register', async (req, res) => {
-  const { name, email, phone, password, referral_code } = req.body;
+  // Added 'country' to reflect init-db.js schema
+  const { name, email, phone, country, password, referral_code } = req.body;
 
-  if (!name || !email || !phone || !password) {
+  if (!name || !email || !phone || !password || !country) {
     return res.status(400).json({
       success: false,
-      message: 'All fields are required (name, email, phone, password).'
+      message: 'All fields are required (name, email, phone, country, password).'
     });
   }
 
@@ -208,12 +209,15 @@ app.post('/api/auth/register', async (req, res) => {
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
-    const verification_code = generateVerificationCode(); // NEW: Generate code
+    // PIN is set later, but schema requires a value. Use empty string or hash a default/placeholder.
+    const defaultPin = await hashPin('0000'); 
+    const verification_code = generateVerificationCode(); 
 
     const result = await pool.query(
-      `INSERT INTO users (name, email, phone, password, is_verified, verification_code, referral_code)
-       VALUES ($1, $2, $3, $4, FALSE, $5, $6) RETURNING id, name, email, phone`,
-      [name, email, phone, hashedPassword, verification_code, referral_code]
+      // Updated query to include 'country' and 'pin'
+      `INSERT INTO users (name, email, phone, country, password, pin, is_verified, verification_code)
+       VALUES ($1, $2, $3, $4, $5, $6, FALSE, $7) RETURNING id, name, email, phone`,
+      [name, email, phone, country, hashedPassword, defaultPin, verification_code]
     );
 
     const user = result.rows[0];
@@ -358,8 +362,9 @@ app.post('/api/auth/login', async (req, res) => {
   }
 
   try {
+    // Select the 'pin' column to check if a PIN is set
     const result = await pool.query(
-      'SELECT id, email, password, is_verified, pin_hash FROM users WHERE email = $1 OR phone = $1',
+      'SELECT id, email, password, is_verified, pin FROM users WHERE email = $1 OR phone = $1',
       [emailOrPhone]
     );
 
@@ -388,7 +393,7 @@ app.post('/api/auth/login', async (req, res) => {
         });
     }
     
-    // NEW: Update FCM token if provided
+    // NEW: Update FCM token if provided (assuming this column exists)
     if (fcm_token) {
         await pool.query('UPDATE users SET fcm_token = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [fcm_token, user.id]);
     }
@@ -401,7 +406,8 @@ app.post('/api/auth/login', async (req, res) => {
       success: true,
       message: 'Login successful.',
       token: token,
-      pin_is_set: !!user.pin_hash
+      // Check for the 'pin' column's value
+      pin_is_set: user.pin !== null && user.pin !== '0000' // Assuming default '0000' is unset
     });
 
   } catch (error) {
@@ -425,8 +431,9 @@ app.post('/api/auth/set-pin', authenticateToken, async (req, res) => {
     try {
         const hashedPin = await hashPin(pin);
         
+        // Use the 'pin' column name
         await pool.query(
-            'UPDATE users SET pin_hash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 AND pin_hash IS NULL RETURNING id',
+            'UPDATE users SET pin = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING id',
             [hashedPin, req.user.id]
         );
         
@@ -443,8 +450,9 @@ app.post('/api/auth/forgot-pin', authenticateToken, async (req, res) => {
         const token = generateResetPinToken();
         const resetPinLink = `https://your-mobile-app.com/reset-pin?token=${token}`; // Adjust to your mobile app deep link
 
+        // Use 'pin_reset_code' and 'pin_reset_expires'
         await pool.query(
-            'UPDATE users SET pin_reset_token = $1, pin_token_expires_at = NOW() + INTERVAL \'1 hour\' WHERE id = $2 RETURNING name, email',
+            'UPDATE users SET pin_reset_code = $1, pin_reset_expires = NOW() + INTERVAL \'1 hour\' WHERE id = $2 RETURNING name, email',
             [token, req.user.id]
         );
 
@@ -477,11 +485,12 @@ app.post('/api/auth/reset-pin', authenticateToken, async (req, res) => {
     }
 
     try {
+        // Use 'pin_reset_code' and 'pin_reset_expires' for lookup
         const result = await pool.query(
             `SELECT id FROM users 
              WHERE id = $1 
-               AND pin_reset_token = $2 
-               AND pin_token_expires_at > NOW()`,
+               AND pin_reset_code = $2 
+               AND pin_reset_expires > NOW()`,
             [req.user.id, token]
         );
         
@@ -491,9 +500,10 @@ app.post('/api/auth/reset-pin', authenticateToken, async (req, res) => {
 
         const hashedPin = await hashPin(newPin);
         
+        // Use 'pin', 'pin_reset_code', and 'pin_reset_expires' for update
         await pool.query(
             `UPDATE users 
-             SET pin_hash = $1, pin_reset_token = NULL, pin_token_expires_at = NULL, updated_at = CURRENT_TIMESTAMP 
+             SET pin = $1, pin_reset_code = NULL, pin_reset_expires = NULL, updated_at = CURRENT_TIMESTAMP 
              WHERE id = $2`,
             [hashedPin, req.user.id]
         );
@@ -512,12 +522,12 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT 
-         u.name, u.email, u.phone, u.created_at, u.is_verified, 
-         w.balance, u.pin_hash IS NOT NULL AS pin_is_set
+         u.name, u.email, u.phone, u.country, u.created_at, u.is_verified, 
+         w.balance, u.pin IS NOT NULL AND u.pin != $2 AS pin_is_set
        FROM users u
        JOIN wallets w ON u.id = w.user_id
        WHERE u.id = $1`,
-      [req.user.id]
+      [req.user.id, await hashPin('0000')] // Check if pin is set and not the default value
     );
 
     if (result.rows.length === 0) {
@@ -535,6 +545,7 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
         name: user.name,
         email: user.email,
         phone: user.phone,
+        country: user.country,
         balance: user.balance,
         pin_is_set: user.pin_is_set,
         is_verified: user.is_verified,
@@ -595,15 +606,18 @@ app.post('/api/services/airtime', authenticateToken, async (req, res) => {
     await client.query('BEGIN');
 
     // 1. Verify PIN
-    const pinCheck = await client.query('SELECT pin_hash, fcm_token FROM users WHERE id = $1 FOR UPDATE', [req.user.id]);
+    // Select the 'pin' column
+    const pinCheck = await client.query('SELECT pin, fcm_token FROM users WHERE id = $1 FOR UPDATE', [req.user.id]);
     const user = pinCheck.rows[0];
 
-    if (!user || !user.pin_hash) {
+    // Check against the 'pin' column
+    if (!user || !user.pin || user.pin === await hashPin('0000')) {
       await client.query('ROLLBACK');
       return res.status(403).json({ success: false, message: 'Transaction PIN not set. Please set your PIN first.' });
     }
 
-    const pinMatch = await verifyPin(pin, user.pin_hash);
+    // Compare against the 'pin' column's hash
+    const pinMatch = await verifyPin(pin, user.pin);
 
     if (!pinMatch) {
       await client.query('ROLLBACK');
@@ -682,7 +696,8 @@ app.post('/api/admin/login', async (req, res) => {
 });
 
 app.post('/api/admin/referral-codes', authenticateToken, authorizeAdmin, async (req, res) => {
-    const { code, discount_percentage, max_uses, expiry_date, min_transaction } = req.body;
+    // Note: The new schema for referral_codes has is_single_use, owner_user_id
+    const { code, discount_percentage, is_single_use, expiry_date, owner_user_id } = req.body;
     
     if (!code || !discount_percentage) {
         return res.status(400).json({ success: false, message: 'Code and discount_percentage are required.' });
@@ -690,9 +705,10 @@ app.post('/api/admin/referral-codes', authenticateToken, authorizeAdmin, async (
     
     try {
         await pool.query(
-            `INSERT INTO referral_codes (code, discount_percentage, max_uses, expiry_date, min_transaction)
+            // Updated to reflect new schema columns
+            `INSERT INTO referral_codes (code, discount_percentage, is_single_use, expiry_date, owner_user_id)
              VALUES ($1, $2, $3, $4, $5)`,
-            [code, discount_percentage, max_uses || null, expiry_date || null, min_transaction || 0]
+            [code, discount_percentage, is_single_use || false, expiry_date || null, owner_user_id || null]
         );
         
         res.status(201).json({ success: true, message: `Referral code ${code} created successfully.` });
@@ -720,7 +736,7 @@ app.post('/api/admin/notifications', authenticateToken, authorizeAdmin, async (r
     try {
         let tokens;
         if (target_user_id) {
-            // Send to a single user
+            // Send to a single user (assuming fcm_token is added to the users table)
             const result = await pool.query('SELECT fcm_token FROM users WHERE id = $1 AND fcm_token IS NOT NULL', [target_user_id]);
             tokens = result.rows.map(row => row.fcm_token);
             if (tokens.length === 0) {
@@ -779,8 +795,9 @@ app.use((error, req, res, next) => {
 // Initialize database and start server
 const startServer = async () => {
   try {
-    // Call the imported function
-    await initDatabase(pool); 
+    // ⚡ FIX 2: Call the function without arguments, since init-db.js manages its own pool.
+    // This will run the schema initialization code
+    await initDatabase(); 
     
     const PORT = process.env.PORT || 10000;
     app.listen(PORT, '0.0.0.0', () => {
