@@ -12,7 +12,8 @@ const path = require('path'); // 👈 NEW: For path resolving
 require('dotenv').config();
 
 // Assuming init-db.js exports a function to run the migrations/setup
-const { initializeDatabase } = require('./init-db');
+// ⚡ FIX: Renamed import to match the likely export 'initDatabase'
+const { initDatabase } = require('./init-db');
 
 const app = express();
 
@@ -779,9 +780,8 @@ app.use((error, req, res, next) => {
 // Initialize database and start server
 const startServer = async () => {
   try {
-    // This calls the initializeDatabase function from init-db.js
-    // It will create/update tables, including the new ones (is_verified, verification_code, pin_hash, fcm_token, referral_code, referral_codes)
-    await initializeDatabase(pool); 
+    // ⚡ FIX: Call the correct function name: initDatabase
+    await initDatabase(pool); 
     
     const PORT = process.env.PORT || 10000;
     app.listen(PORT, '0.0.0.0', () => {
