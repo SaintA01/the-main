@@ -5,864 +5,795 @@ const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
-const sgMail = require('@sendgrid/mail');
-const admin = require('firebase-admin');
+const admin = require('firebase-admin'); // 👈 NEW: For Firebase Admin SDK
+const sgMail = require('@sendgrid/mail'); // 👈 NEW: For SendGrid Email
+const fs = require('fs'); // 👈 NEW: For reading email templates
+const path = require('path'); // 👈 NEW: For path resolving
 require('dotenv').config();
 
-// --- App Initialization ---
+// Assuming init-db.js exports a function to run the migrations/setup
+const { initializeDatabase } = require('./init-db');
+
 const app = express();
-sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
-// --- Firebase Admin Initialization ---
-// !! IMPORTANT !!
-// You must download your "serviceAccountKey.json" from Firebase
-// and place it in this directory for push notifications to work.
-try {
-  const serviceAccount = require('./serviceAccountKey.json');
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
-  });
-  console.log('✅ Firebase Admin SDK initialized.');
-} catch (error) {
-  console.warn('⚠️ Firebase Admin SDK failed to initialize. Push notifications will not work.');
-  console.warn('Error:', error.message);
-}
+// --- Core Configuration and Middleware ---
 
-
-// --- Middleware ---
 app.use(helmet());
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'Accept']
 }));
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Rate limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100
+  max: 100,
+  message: 'Too many requests from this IP, please try again after 15 minutes.'
 });
 app.use(limiter);
 
-// --- PostgreSQL Connection ---
+// PostgreSQL connection
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
 });
 
-pool.on('connect', () => console.log('✅ PostgreSQL connected successfully'));
-pool.on('error', (err) => console.error('❌ PostgreSQL connection error:', err));
+// Test database connection
+pool.on('connect', () => {
+  console.log('✅ PostgreSQL connected successfully');
+});
 
+pool.on('error', (err) => {
+  console.error('❌ PostgreSQL connection error:', err);
+});
 
-// --- Helper Functions ---
-/**
- * Generates a random 6-digit numeric code.
- * @returns {string} A 6-digit code.
- */
-const generateCode = (length = 6) => {
-  return crypto.randomInt(10**(length-1), 10**length - 1).toString();
+// --- Firebase and SendGrid Setup ---
+
+// NEW: Firebase Admin SDK Initialization (Secure Environment Variable Method)
+const serviceAccountString = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+let firebaseAdminInitialized = false;
+
+if (serviceAccountString) {
+  try {
+    const serviceAccount = JSON.parse(serviceAccountString);
+
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
+      // If you are using Realtime Database or Storage, add 'databaseURL' here
+    });
+    firebaseAdminInitialized = true;
+    console.log('✅ Firebase Admin SDK initialized from environment variable');
+  } catch (e) {
+    console.error('❌ Error parsing FIREBASE_SERVICE_ACCOUNT_JSON:', e.message);
+    console.error('   Push notifications will be disabled.');
+  }
+} else {
+  console.warn('⚠️ FIREBASE_SERVICE_ACCOUNT_JSON environment variable not set. Push notifications will be disabled.');
+}
+
+// NEW: Set SendGrid API Key and Sender
+sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+const SENDER_EMAIL = process.env.SENDGRID_VERIFIED_SENDER || 'contact.quicktop@gmail.com';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'quicktop_admin_pass_2025!';
+
+// --- Utility Functions ---
+
+const generateVerificationCode = () => Math.floor(100000 + Math.random() * 900000).toString();
+const generateResetPinToken = () => Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+const hashPin = async (pin) => bcrypt.hash(pin.toString(), 10);
+const verifyPin = async (pin, hashedPin) => bcrypt.compare(pin.toString(), hashedPin);
+
+const getEmailTemplate = (templateName, replacements = {}) => {
+  try {
+    let html = fs.readFileSync(path.join(__dirname, templateName), 'utf8');
+    for (const [key, value] of Object.entries(replacements)) {
+      html = html.replace(new RegExp(`{${key}}`, 'g'), value);
+    }
+    return html;
+  } catch (error) {
+    console.error(`❌ Error reading email template ${templateName}:`, error);
+    return `<p>Error loading email content. Subject: ${templateName}</p>`;
+  }
 };
 
-/**
- * Sends an email using SendGrid.
- * @param {string} to - Recipient email.
- * @param {string} subject - Email subject.
- * @param {string} templatePath - Path to the HTML template.
- * @param {object} replacements - Key-value pairs to replace in the template (e.g., {user_name: "Test"}).
- */
-const sendEmail = async (to, subject, templatePath, replacements = {}) => {
+const sendEmail = async (to, subject, htmlContent) => {
+  const msg = {
+    to,
+    from: SENDER_EMAIL,
+    subject,
+    html: htmlContent,
+  };
   try {
-    const template = await fs.promises.readFile(path.join(__dirname, templatePath), 'utf-8');
-    
-    let html = template;
-    for (const key in replacements) {
-      html = html.replace(new RegExp(`{${key}}`, 'g'), replacements[key]);
-    }
-
-    const msg = {
-      to,
-      from: process.env.SENDGRID_VERIFIED_SENDER,
-      subject: `QuickTop - ${subject}`,
-      html: html,
-    };
-
     await sgMail.send(msg);
-    console.log(`✅ Email sent to ${to}: ${subject}`);
+    console.log(`✉️ Email sent to ${to}: ${subject}`);
+    return true;
   } catch (error) {
-    console.error(`❌ Failed to send email to ${to}:`, error.response ? error.response.body : error);
+    console.error('❌ SendGrid Email Error:', error.response ? JSON.stringify(error.response.body.errors) : error.message);
+    return false;
   }
 };
 
-
-// --- Authentication Middleware ---
-const authenticateToken = async (req, res, next) => {
-  try {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-    if (!token) {
-      return res.status(401).json({ success: false, message: 'Access token required' });
+const sendPushNotification = async (token, title, body) => {
+    if (!firebaseAdminInitialized) {
+        console.warn('Push notification failed: Firebase Admin SDK not initialized.');
+        return false;
     }
-
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    
-    const userResult = await pool.query(
-      'SELECT id, name, email, phone, country, is_verified, created_at FROM users WHERE id = $1',
-      [decoded.userId]
-    );
-    
-    if (userResult.rows.length === 0) {
-      return res.status(401).json({ success: false, message: 'User not found' });
-    }
-
-    // Check if user is verified (optional, remove if not needed for all routes)
-    if (!userResult.rows[0].is_verified) {
-      // return res.status(403).json({ success: false, message: 'Please verify your email to access this route.' });
-    }
-    
-    req.user = userResult.rows[0];
-    next();
-  } catch (error) {
-    return res.status(403).json({ success: false, message: 'Invalid or expired token' });
-  }
-};
-
-const adminAuth = (req, res, next) => {
+    const message = {
+        notification: { title, body },
+        token: token,
+    };
     try {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-    if (!token) {
-      return res.status(401).json({ success: false, message: 'Admin access token required' });
+        const response = await admin.messaging().send(message);
+        console.log('Successfully sent message:', response);
+        return true;
+    } catch (error) {
+        console.error('Error sending push notification:', error);
+        return false;
     }
-
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    if (!decoded.admin) {
-        return res.status(403).json({ success: false, message: 'Forbidden: Admin access required' });
-    }
-    
-    next();
-  } catch (error) {
-    return res.status(403).json({ success: false, message: 'Invalid or expired admin token' });
-  }
 };
 
+// --- Middleware ---
 
-// --- Public Routes ---
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({
+      success: false,
+      message: 'Access denied. No token provided.'
+    });
+  }
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) {
+      console.error('JWT verification error:', err.message);
+      return res.status(403).json({
+        success: false,
+        message: 'Invalid or expired token.'
+      });
+    }
+    req.user = user;
+    next();
+  });
+};
+
+const authorizeAdmin = (req, res, next) => {
+    if (!req.user || req.user.role !== 'admin') {
+        return res.status(403).json({ success: false, message: 'Admin access required.' });
+    }
+    next();
+};
+
+// --- API Routes ---
+
+// Simple test route
 app.get('/', (req, res) => {
   res.json({
     success: true,
     message: '🚀 QuickTop Backend API is running!',
+    timestamp: new Date().toISOString(),
+    // Added endpoint list for easy reference
+    endpoints: {
+      auth: ['/api/auth/register', '/api/auth/login', '/api/auth/verify-email', '/api/auth/set-pin'],
+      user: ['/api/user/profile', '/api/user/transactions'],
+      services: ['/api/services/airtime'],
+      admin: ['/api/admin/login', '/api/admin/referral-codes', '/api/admin/notifications']
+    }
   });
 });
 
-app.get('/api/health', async (req, res) => {
-  try {
-    await pool.query('SELECT NOW()');
-    res.json({ success: true, message: '✅ API is healthy', database: 'connected' });
-  } catch (error) {
-    res.status(500).json({ success: false, message: '❌ API is unhealthy', database: 'disconnected' });
+// --- AUTH ROUTES ---
+app.post('/api/auth/register', async (req, res) => {
+  const { name, email, phone, password, referral_code } = req.body;
+
+  if (!name || !email || !phone || !password) {
+    return res.status(400).json({
+      success: false,
+      message: 'All fields are required (name, email, phone, password).'
+    });
   }
-});
 
-
-// --- Auth Endpoints ---
-
-// 1A. SIGNUP (Modified)
-app.post('/api/auth/signup', async (req, res) => {
-  console.log('📝 Signup request received:', req.body.email);
   try {
-    const { name, email, phone, password, country, pin, referralCode } = req.body;
-
-    // Validation
-    if (!name || !email || !phone || !password || !country || !pin) {
-      return res.status(400).json({ success: false, message: 'All fields are required: name, email, phone, password, country, pin' });
-    }
-    if (password.length < 6) {
-      return res.status(400).json({ success: false, message: 'Password must be at least 6 characters long' });
-    }
-    if (!/^\d{4}$/.test(pin)) {
-        return res.status(400).json({ success: false, message: 'PIN must be exactly 4 digits' });
-    }
-
     const existingUser = await pool.query('SELECT id FROM users WHERE email = $1 OR phone = $2', [email, phone]);
     if (existingUser.rows.length > 0) {
-      return res.status(409).json({ success: false, message: 'User with this email or phone already exists' });
+      return res.status(409).json({
+        success: false,
+        message: 'User with this email or phone number already exists.'
+      });
     }
 
-    // Referral Logic
-    let discount = 0.00;
-    let referredByCodeId = null;
-    if (referralCode) {
-        const codeResult = await pool.query(
-            'SELECT * FROM referral_codes WHERE code = $1 AND is_used = false AND (expiry_date IS NULL OR expiry_date > NOW())',
-            [referralCode]
-        );
-        if (codeResult.rows.length > 0) {
-            const codeData = codeResult.rows[0];
-            discount = codeData.discount_percentage;
-            referredByCodeId = codeData.id;
-            if (codeData.is_single_use) {
-                await pool.query('UPDATE referral_codes SET is_used = true WHERE id = $1', [codeData.id]);
-            }
-            // TODO: Credit the referrer (owner_user_id) if implementing that bonus
-        }
-    }
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const verification_code = generateVerificationCode(); // NEW: Generate code
 
-    // Hash passwords & codes
-    const hashedPassword = await bcrypt.hash(password, 12);
-    const hashedPin = await bcrypt.hash(pin, 12);
-    const verificationCode = generateCode(6);
-    const hashedVerificationCode = await bcrypt.hash(verificationCode, 12);
-    const verificationExpires = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
-
-    // Create user
-    const userResult = await pool.query(
-      `INSERT INTO users (name, email, phone, password, country, pin, is_verified, verification_code, verification_expires, signup_discount, referred_by_code_id) 
-       VALUES ($1, $2, $3, $4, $5, $6, false, $7, $8, $9, $10) 
-       RETURNING id, name, email, phone`,
-      [name, email, phone, hashedPassword, country, hashedPin, hashedVerificationCode, verificationExpires, discount, referredByCodeId]
-    );
-    const user = userResult.rows[0];
-
-    // Create wallet (default 0 balance)
-    await pool.query('INSERT INTO wallets (user_id, balance) VALUES ($1, 0.00)', [user.id]);
-
-    // Send verification email
-    await sendEmail(
-        user.email,
-        'Verify Your Account',
-        'emailver.html',
-        { user_name: user.name, VERIFICATION_LINK: `Your code is ${verificationCode}` } // Note: Template expects a link, we send a code.
+    const result = await pool.query(
+      `INSERT INTO users (name, email, phone, password, is_verified, verification_code, referral_code)
+       VALUES ($1, $2, $3, $4, FALSE, $5, $6) RETURNING id, name, email, phone`,
+      [name, email, phone, hashedPassword, verification_code, referral_code]
     );
 
-    console.log(`✅ Verification code for ${user.email}: ${verificationCode}`);
+    const user = result.rows[0];
+
+    // NEW: Create wallet for user
+    await pool.query('INSERT INTO wallets (user_id) VALUES ($1)', [user.id]);
     
+    // NEW: Send verification email
+    const htmlContent = getEmailTemplate('emailver.html', { 
+        user_name: user.name, 
+        VERIFICATION_CODE: verification_code 
+    });
+    
+    const emailSent = await sendEmail(user.email, 'QuickTop: Verify Your Account', htmlContent);
+
     res.status(201).json({
       success: true,
-      message: 'Verification email sent. Please check your inbox for the 6-digit code.'
+      message: 'Registration successful. Please check your email for the verification code.',
+      user: { id: user.id, email: user.email, phone: user.phone },
+      emailSent: emailSent
     });
 
   } catch (error) {
-    console.error('❌ Signup error:', error);
-    res.status(500).json({ success: false, message: 'Internal server error' });
+    console.error('Registration error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error'
+    });
   }
 });
 
-// 1B. VERIFY EMAIL (New)
 app.post('/api/auth/verify-email', async (req, res) => {
+    const { email, code } = req.body;
+
+    if (!email || !code) {
+        return res.status(400).json({ success: false, message: 'Email and verification code are required.' });
+    }
+
     try {
-        const { email, code } = req.body;
-        if (!email || !code) {
-            return res.status(400).json({ success: false, message: 'Email and code are required' });
-        }
-
-        const userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-        if (userResult.rows.length === 0) {
-            return res.status(400).json({ success: false, message: 'User not found' });
-        }
-
-        const user = userResult.rows[0];
-        if (user.is_verified) {
-            return res.status(400).json({ success: false, message: 'Account already verified' });
-        }
-
-        if (user.verification_expires < new Date()) {
-            return res.status(400).json({ success: false, message: 'Verification code has expired' });
-        }
-
-        const isCodeValid = await bcrypt.compare(code, user.verification_code);
-        if (!isCodeValid) {
-            return res.status(400).json({ success: false, message: 'Invalid verification code' });
-        }
-
-        // Verification successful
-        await pool.query(
-            'UPDATE users SET is_verified = true, verification_code = NULL, verification_expires = NULL WHERE id = $1',
-            [user.id]
+        const result = await pool.query(
+            'SELECT id, name, is_verified, verification_code FROM users WHERE email = $1',
+            [email]
         );
 
-        // Generate token
-        const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, { expiresIn: '30d' });
+        const user = result.rows[0];
+
+        if (!user) {
+            return res.status(404).json({ success: false, message: 'User not found.' });
+        }
+
+        if (user.is_verified) {
+            return res.status(400).json({ success: false, message: 'Account already verified.' });
+        }
+
+        if (user.verification_code !== code) {
+            return res.status(401).json({ success: false, message: 'Invalid verification code.' });
+        }
+
+        // Verification successful: update user status
+        await pool.query(
+            'UPDATE users SET is_verified = TRUE, verification_code = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1',
+            [user.id]
+        );
+        
+        // Generate JWT token (Only after verification)
+        const token = jwt.sign({ id: user.id, email: user.email, role: 'user' }, process.env.JWT_SECRET, {
+            expiresIn: process.env.JWT_EXPIRES_IN || '30d'
+        });
 
         // Send welcome email
-        await sendEmail(user.email, 'Welcome to QuickTop!', 'emailwel.html', { user_name: user.name });
+        const welcomeHtml = getEmailTemplate('emailwel.html', { user_name: user.name });
+        await sendEmail(email, 'Welcome to QuickTop!', welcomeHtml);
 
         res.json({
             success: true,
-            message: 'Email verified successfully!',
-            token,
-            user: {
-                id: user.id,
-                name: user.name,
-                email: user.email,
-                phone: user.phone
-            }
+            message: 'Email verified successfully. Welcome to QuickTop!',
+            token: token
         });
 
     } catch (error) {
-        console.error('❌ Verify email error:', error);
+        console.error('Email verification error:', error);
         res.status(500).json({ success: false, message: 'Internal server error' });
     }
 });
 
-// 1C. RESEND CODE (New)
 app.post('/api/auth/resend-code', async (req, res) => {
+    const { email } = req.body;
+
+    if (!email) {
+        return res.status(400).json({ success: false, message: 'Email is required.' });
+    }
+
     try {
-        const { email } = req.body;
-        if (!email) {
-            return res.status(400).json({ success: false, message: 'Email is required' });
+        const result = await pool.query(
+            'SELECT id, name, is_verified FROM users WHERE email = $1',
+            [email]
+        );
+        const user = result.rows[0];
+
+        if (!user) {
+            return res.status(404).json({ success: false, message: 'User not found.' });
         }
 
-        const userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-        if (userResult.rows.length === 0) {
-            return res.status(400).json({ success: false, message: 'User not found' });
-        }
-        
-        const user = userResult.rows[0];
         if (user.is_verified) {
-            return res.status(400).json({ success: false, message: 'Account already verified' });
+            return res.status(400).json({ success: false, message: 'Account is already verified. Please login.' });
         }
 
-        // Generate new code
-        const verificationCode = generateCode(6);
-        const hashedVerificationCode = await bcrypt.hash(verificationCode, 12);
-        const verificationExpires = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
-
+        const new_code = generateVerificationCode();
+        
         await pool.query(
-            'UPDATE users SET verification_code = $1, verification_expires = $2 WHERE id = $3',
-            [hashedVerificationCode, verificationExpires, user.id]
+            'UPDATE users SET verification_code = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+            [new_code, user.id]
         );
 
-        // Resend verification email
-        await sendEmail(
-            user.email,
-            'New Verification Code',
-            'emailver.html',
-            { user_name: user.name, VERIFICATION_LINK: `Your new code is ${verificationCode}` }
-        );
+        const htmlContent = getEmailTemplate('emailver.html', { 
+            user_name: user.name, 
+            VERIFICATION_CODE: new_code 
+        });
+        
+        const emailSent = await sendEmail(email, 'QuickTop: New Verification Code', htmlContent);
 
-        console.log(`✅ Resent code for ${user.email}: ${verificationCode}`);
-        res.json({ success: true, message: 'A new verification code has been sent.' });
+        res.json({
+            success: true,
+            message: 'A new verification code has been sent to your email.',
+            emailSent: emailSent
+        });
 
     } catch (error) {
-        console.error('❌ Resend code error:', error);
+        console.error('Resend code error:', error);
         res.status(500).json({ success: false, message: 'Internal server error' });
     }
 });
 
-// LOGIN (Unchanged, but user must be verified)
 app.post('/api/auth/login', async (req, res) => {
+  const { emailOrPhone, password, fcm_token } = req.body;
+
+  if (!emailOrPhone || !password) {
+    return res.status(400).json({
+      success: false,
+      message: 'Email/Phone and password are required.'
+    });
+  }
+
   try {
-    const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ success: false, message: 'Email and password are required' });
+    const result = await pool.query(
+      'SELECT id, email, password, is_verified, pin_hash FROM users WHERE email = $1 OR phone = $1',
+      [emailOrPhone]
+    );
+
+    const user = result.rows[0];
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid email/phone or password.'
+      });
     }
 
-    const userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-    if (userResult.rows.length === 0) {
-      return res.status(401).json({ success: false, message: 'Invalid email or password' });
+    const passwordMatch = await bcrypt.compare(password, user.password);
+
+    if (!passwordMatch) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid email/phone or password.'
+      });
     }
 
-    const user = userResult.rows[0];
-
-    const isPasswordValid = await bcrypt.compare(password, user.password);
-    if (!isPasswordValid) {
-      return res.status(401).json({ success: false, message: 'Invalid email or password' });
-    }
-
-    // Check if verified
     if (!user.is_verified) {
         return res.status(403).json({
             success: false,
-            message: 'Account not verified. Please check your email for the verification code.'
+            message: 'Account not verified. Please verify your email first.'
         });
     }
+    
+    // NEW: Update FCM token if provided
+    if (fcm_token) {
+        await pool.query('UPDATE users SET fcm_token = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [fcm_token, user.id]);
+    }
 
-    const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, { expiresIn: '30d' });
+    const token = jwt.sign({ id: user.id, email: user.email, role: 'user' }, process.env.JWT_SECRET, {
+      expiresIn: process.env.JWT_EXPIRES_IN || '30d'
+    });
 
     res.json({
       success: true,
-      message: 'Login successful',
-      token,
+      message: 'Login successful.',
+      token: token,
+      pin_is_set: !!user.pin_hash
+    });
+
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error'
+    });
+  }
+});
+
+// --- PIN Management Routes (Requires Auth) ---
+
+app.post('/api/auth/set-pin', authenticateToken, async (req, res) => {
+    const { pin } = req.body;
+
+    if (!pin || pin.length !== 4 || isNaN(pin)) {
+        return res.status(400).json({ success: false, message: 'A 4-digit numeric PIN is required.' });
+    }
+
+    try {
+        const hashedPin = await hashPin(pin);
+        
+        await pool.query(
+            'UPDATE users SET pin_hash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 AND pin_hash IS NULL RETURNING id',
+            [hashedPin, req.user.id]
+        );
+        
+        res.json({ success: true, message: 'Transaction PIN set successfully!' });
+
+    } catch (error) {
+        console.error('Set PIN error:', error);
+        res.status(500).json({ success: false, message: 'Internal server error' });
+    }
+});
+
+app.post('/api/auth/forgot-pin', authenticateToken, async (req, res) => {
+    try {
+        const token = generateResetPinToken();
+        const resetPinLink = `https://your-mobile-app.com/reset-pin?token=${token}`; // Adjust to your mobile app deep link
+
+        await pool.query(
+            'UPDATE users SET pin_reset_token = $1, pin_token_expires_at = NOW() + INTERVAL \'1 hour\' WHERE id = $2 RETURNING name, email',
+            [token, req.user.id]
+        );
+
+        const user = (await pool.query('SELECT name, email FROM users WHERE id = $1', [req.user.id])).rows[0];
+
+        const htmlContent = getEmailTemplate('forgotpin.html', {
+            user_name: user.name,
+            RESET_PIN_LINK: resetPinLink
+        });
+        
+        const emailSent = await sendEmail(user.email, 'QuickTop: Transaction PIN Reset', htmlContent);
+
+        res.json({
+            success: true,
+            message: 'Transaction PIN reset link has been sent to your registered email.',
+            emailSent: emailSent
+        });
+
+    } catch (error) {
+        console.error('Forgot PIN error:', error);
+        res.status(500).json({ success: false, message: 'Internal server error' });
+    }
+});
+
+app.post('/api/auth/reset-pin', authenticateToken, async (req, res) => {
+    const { token, newPin } = req.body;
+
+    if (!token || !newPin || newPin.length !== 4 || isNaN(newPin)) {
+        return res.status(400).json({ success: false, message: 'Valid token and new 4-digit PIN are required.' });
+    }
+
+    try {
+        const result = await pool.query(
+            `SELECT id FROM users 
+             WHERE id = $1 
+               AND pin_reset_token = $2 
+               AND pin_token_expires_at > NOW()`,
+            [req.user.id, token]
+        );
+        
+        if (result.rows.length === 0) {
+            return res.status(401).json({ success: false, message: 'Invalid or expired reset token.' });
+        }
+
+        const hashedPin = await hashPin(newPin);
+        
+        await pool.query(
+            `UPDATE users 
+             SET pin_hash = $1, pin_reset_token = NULL, pin_token_expires_at = NULL, updated_at = CURRENT_TIMESTAMP 
+             WHERE id = $2`,
+            [hashedPin, req.user.id]
+        );
+        
+        res.json({ success: true, message: 'Transaction PIN reset successfully!' });
+
+    } catch (error) {
+        console.error('Reset PIN error:', error);
+        res.status(500).json({ success: false, message: 'Internal server error' });
+    }
+});
+
+// --- USER ROUTES ---
+
+app.get('/api/user/profile', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT 
+         u.name, u.email, u.phone, u.created_at, u.is_verified, 
+         w.balance, u.pin_hash IS NOT NULL AS pin_is_set
+       FROM users u
+       JOIN wallets w ON u.id = w.user_id
+       WHERE u.id = $1`,
+      [req.user.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found.'
+      });
+    }
+
+    const user = result.rows[0];
+
+    res.json({
+      success: true,
       user: {
-        id: user.id,
         name: user.name,
         email: user.email,
-        phone: user.phone
+        phone: user.phone,
+        balance: user.balance,
+        pin_is_set: user.pin_is_set,
+        is_verified: user.is_verified,
+        member_since: user.created_at,
       }
     });
 
   } catch (error) {
-    console.error('❌ Login error:', error);
-    res.status(500).json({ success: false, message: 'Internal server error' });
-  }
-});
-
-
-// --- Profile & Wallet Endpoints (Authenticated) ---
-
-app.get('/api/auth/me', authenticateToken, (req, res) => {
-  res.json({ success: true, user: req.user });
-});
-
-// 2A. REQUEST PIN RESET (New)
-app.post('/api/auth/request-pin-reset', authenticateToken, async (req, res) => {
-    try {
-        const user = req.user;
-        
-        const code = generateCode(6);
-        const hashedCode = await bcrypt.hash(code, 12);
-        const expires = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
-
-        await pool.query(
-            'UPDATE users SET pin_reset_code = $1, pin_reset_expires = $2 WHERE id = $3',
-            [hashedCode, expires, user.id]
-        );
-
-        await sendEmail(
-            user.email,
-            'Reset Your Transaction PIN',
-            'forgotpin.html',
-            { user_name: user.name, RESET_PIN_LINK: `Your 6-digit PIN reset code is ${code}` }
-        );
-
-        console.log(`✅ PIN reset code for ${user.email}: ${code}`);
-        res.json({ success: true, message: 'A PIN reset code has been sent to your verified email.' });
-
-    } catch (error) {
-        console.error('❌ Request PIN reset error:', error);
-        res.status(500).json({ success: false, message: 'Internal server error' });
-    }
-});
-
-// 2B. VERIFY PIN RESET (New)
-app.post('/api/auth/verify-pin-reset', authenticateToken, async (req, res) => {
-    try {
-        const { code, newPin } = req.body;
-        const user = req.user;
-
-        if (!code || !newPin) {
-            return res.status(400).json({ success: false, message: 'Code and new PIN are required' });
-        }
-        if (!/^\d{4}$/.test(newPin)) {
-            return res.status(400).json({ success: false, message: 'New PIN must be exactly 4 digits' });
-        }
-
-        const userResult = await pool.query('SELECT * FROM users WHERE id = $1', [user.id]);
-        const dbUser = userResult.rows[0];
-
-        if (dbUser.pin_reset_expires < new Date()) {
-            return res.status(400).json({ success: false, message: 'PIN reset code has expired' });
-        }
-
-        const isCodeValid = await bcrypt.compare(code, dbUser.pin_reset_code);
-        if (!isCodeValid) {
-            return res.status(400).json({ success: false, message: 'Invalid reset code' });
-        }
-
-        // Reset successful
-        const hashedPin = await bcrypt.hash(newPin, 12);
-        await pool.query(
-            'UPDATE users SET pin = $1, pin_reset_code = NULL, pin_reset_expires = NULL WHERE id = $2',
-            [hashedPin, user.id]
-        );
-
-        res.json({ success: true, message: 'Your transaction PIN has been successfully updated.' });
-
-    } catch (error) {
-        console.error('❌ Verify PIN reset error:', error);
-        res.status(500).json({ success: false, message: 'Internal server error' });
-    }
-});
-
-// 3B. GET USER'S OWN REFERRAL CODE (New)
-app.get('/api/profile/referral-code', authenticateToken, async (req, res) => {
-    try {
-        const userId = req.user.id;
-        
-        // Find existing multi-use code
-        let codeResult = await pool.query(
-            'SELECT code FROM referral_codes WHERE owner_user_id = $1 AND is_single_use = false',
-            [userId]
-        );
-
-        if (codeResult.rows.length > 0) {
-            return res.json({ success: true, code: codeResult.rows[0].code });
-        }
-
-        // Not found, generate a new one
-        // Simple code: USERNAME (first 4) + 4 random digits
-        const newCode = (req.user.name.substring(0, 4) + generateCode(4)).toUpperCase();
-        
-        const newCodeResult = await pool.query(
-            `INSERT INTO referral_codes (code, discount_percentage, is_single_use, owner_user_id)
-             VALUES ($1, 5.00, false, $2)
-             RETURNING code`,
-            [newCode, userId]
-        );
-
-        res.status(201).json({ success: true, code: newCodeResult.rows[0].code });
-
-    } catch (error) {
-        console.error('❌ Get referral code error:', error);
-        res.status(500).json({ success: false, message: 'Internal server error' });
-    }
-});
-
-// 4A. DELETE ACCOUNT (New)
-app.delete('/api/profile/delete', authenticateToken, async (req, res) => {
-    try {
-        const { password } = req.body;
-        const userId = req.user.id;
-
-        if (!password) {
-            return res.status(400).json({ success: false, message: 'Password is required to delete account' });
-        }
-
-        const userResult = await pool.query('SELECT password FROM users WHERE id = $1', [userId]);
-        const dbUser = userResult.rows[0];
-
-        const isPasswordValid = await bcrypt.compare(password, dbUser.password);
-        if (!isPasswordValid) {
-            return res.status(400).json({ success: false, message: 'Invalid password' });
-        }
-
-        // Password is valid, proceed with deletion
-        // ON DELETE CASCADE in init-db.js should handle wallets, transactions
-        await pool.query('DELETE FROM users WHERE id = $1', [userId]);
-
-        res.json({ success: true, message: 'Account deleted successfully.' });
-
-    } catch (error) {
-        console.error('❌ Delete account error:', error);
-        res.status(500).json({ success: false, message: 'Internal server error' });
-    }
-});
-
-
-app.get('/api/wallet/balance', authenticateToken, async (req, res) => {
-  try {
-    const result = await pool.query('SELECT balance FROM wallets WHERE user_id = $1', [req.user.id]);
-    res.json({
-      success: true,
-      balance: parseFloat(result.rows[0]?.balance || 0)
+    console.error('Get profile error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error'
     });
-  } catch (error) {
-    console.error('Get balance error:', error);
-    res.status(500).json({ success: false, message: 'Internal server error' });
   }
 });
 
-// Note: This is a MOCK funding endpoint for testing.
-app.post('/api/wallet/fund', authenticateToken, async (req, res) => {
-  try {
-    const { amount } = req.body;
-    if (!amount || amount <= 0) {
-      return res.status(400).json({ success: false, message: 'Valid amount is required' });
-    }
-    const result = await pool.query(
-      'UPDATE wallets SET balance = balance + $1 WHERE user_id = $2 RETURNING balance',
-      [amount, req.user.id]
-    );
-    res.json({ success: true, message: 'Wallet funded successfully', newBalance: parseFloat(result.rows[0].balance) });
-  } catch (error) {
-    console.error('Fund wallet error:', error);
-    res.status(500).json({ success: false, message: 'Internal server error' });
-  }
-});
-
-
-app.get('/api/transactions', authenticateToken, async (req, res) => {
+app.get('/api/user/transactions', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT id, type, service_type, amount, details, created_at 
        FROM transactions 
        WHERE user_id = $1 
        ORDER BY created_at DESC 
-       LIMIT 20`,
+       LIMIT 10`,
       [req.user.id]
     );
-    res.json({ success: true, transactions: result.rows });
+
+    res.json({
+      success: true,
+      transactions: result.rows
+    });
+
   } catch (error) {
     console.error('Get transactions error:', error);
-    res.status(500).json({ success: false, message: 'Internal server error' });
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error'
+    });
   }
 });
 
+// --- SERVICES ROUTES ---
 
-// --- Service Endpoints (PIN Required) ---
-
-// AIRTIME PURCHASE (Modified for PIN)
 app.post('/api/services/airtime', authenticateToken, async (req, res) => {
-  try {
-    const { network, phone, amount, pin } = req.body;
-    const userId = req.user.id;
+  const { amount, phone_number, network, pin } = req.body;
 
-    if (!network || !phone || !amount || !pin) {
-      return res.status(400).json({ success: false, message: 'Network, phone, amount, and PIN are required' });
-    }
-
-    // Verify PIN
-    const userResult = await pool.query('SELECT pin, signup_discount FROM users WHERE id = $1', [userId]);
-    const isPinValid = await bcrypt.compare(pin, userResult.rows[0].pin);
-    if (!isPinValid) {
-        return res.status(401).json({ success: false, message: 'Invalid transaction PIN' });
-    }
-
-    let numericAmount = parseFloat(amount);
-    
-    // TODO: Apply discount if it's the first transaction and signup_discount > 0
-    // let finalAmount = numericAmount * (1 - userResult.rows[0].signup_discount / 100);
-    // ... then clear the signup_discount field.
-    
-    // Check balance
-    const walletResult = await pool.query('SELECT balance FROM wallets WHERE user_id = $1', [userId]);
-    const currentBalance = parseFloat(walletResult.rows[0].balance);
-    if (currentBalance < numericAmount) {
-      return res.status(400).json({ success: false, message: 'Insufficient balance' });
-    }
-
-    // Use a transaction
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-        
-        // 1. Deduct from wallet
-        await client.query('UPDATE wallets SET balance = balance - $1 WHERE user_id = $2', [numericAmount, userId]);
-
-        // 2. Record transaction
-        await client.query(
-          `INSERT INTO transactions (user_id, type, service_type, amount, details) VALUES ($1, $2, $3, $4, $5)`,
-          [userId, 'debit', 'airtime', numericAmount, JSON.stringify({ network, phone, status: 'completed' })]
-        );
-        
-        // 3. Clear signup discount if used (pseudo-logic)
-        // if (userResult.rows[0].signup_discount > 0) {
-        //   await client.query('UPDATE users SET signup_discount = 0 WHERE id = $1', [userId]);
-        // }
-        
-        await client.query('COMMIT');
-
-        res.json({
-          success: true,
-          message: `Airtime purchase successful! ₦${numericAmount} sent to ${phone}`,
-          transaction: { type: 'airtime', amount: numericAmount, phone: phone, network: network }
-        });
-
-    } catch (e) {
-        await client.query('ROLLBACK');
-        throw e;
-    } finally {
-        client.release();
-    }
-
-  } catch (error) {
-    console.error('Airtime purchase error:', error);
-    res.status(500).json({ success: false, message: 'Internal server error' });
+  if (!amount || !phone_number || !network || !pin) {
+    return res.status(400).json({ success: false, message: 'Amount, phone number, network, and PIN are required.' });
   }
-});
 
-// DATA PURCHASE (Modified for PIN)
-app.post('/api/services/data', authenticateToken, async (req, res) => {
+  const transactionAmount = parseFloat(amount);
+  if (isNaN(transactionAmount) || transactionAmount <= 0) {
+      return res.status(400).json({ success: false, message: 'Invalid transaction amount.' });
+  }
+
+  const client = await pool.connect();
   try {
-    const { network, phone, plan, amount, pin } = req.body;
-    const userId = req.user.id;
+    await client.query('BEGIN');
 
-    if (!network || !phone || !plan || !amount || !pin) {
-      return res.status(400).json({ success: false, message: 'Network, phone, plan, amount, and PIN are required' });
-    }
-    
-    // Verify PIN
-    const userResult = await pool.query('SELECT pin FROM users WHERE id = $1', [userId]);
-    const isPinValid = await bcrypt.compare(pin, userResult.rows[0].pin);
-    if (!isPinValid) {
-        return res.status(401).json({ success: false, message: 'Invalid transaction PIN' });
-    }
-    
-    const numericAmount = parseFloat(amount);
-    
-    // Check balance
-    const walletResult = await pool.query('SELECT balance FROM wallets WHERE user_id = $1', [userId]);
-    const currentBalance = parseFloat(walletResult.rows[0].balance);
-    if (currentBalance < numericAmount) {
-      return res.status(400).json({ success: false, message: 'Insufficient balance' });
+    // 1. Verify PIN
+    const pinCheck = await client.query('SELECT pin_hash, fcm_token FROM users WHERE id = $1 FOR UPDATE', [req.user.id]);
+    const user = pinCheck.rows[0];
+
+    if (!user || !user.pin_hash) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ success: false, message: 'Transaction PIN not set. Please set your PIN first.' });
     }
 
-    // Use a transaction
-    const client = await pool.connect();
-     try {
-        await client.query('BEGIN');
+    const pinMatch = await verifyPin(pin, user.pin_hash);
 
-        // 1. Deduct from wallet
-        await client.query('UPDATE wallets SET balance = balance - $1 WHERE user_id = $2', [numericAmount, userId]);
+    if (!pinMatch) {
+      await client.query('ROLLBACK');
+      return res.status(401).json({ success: false, message: 'Invalid transaction PIN.' });
+    }
+    
+    // 2. Check Wallet Balance
+    const walletResult = await client.query('SELECT balance FROM wallets WHERE user_id = $1 FOR UPDATE', [req.user.id]);
+    let currentBalance = parseFloat(walletResult.rows[0].balance);
 
-        // 2. Record transaction
-        await client.query(
-          `INSERT INTO transactions (user_id, type, service_type, amount, details) VALUES ($1, $2, $3, $4, $5)`,
-          [userId, 'debit', 'data', numericAmount, JSON.stringify({ network, phone, plan, status: 'completed' })]
-        );
-        
-        await client.query('COMMIT');
-        
-        res.json({
-          success: true,
-          message: `Data purchase successful! ${plan} data sent to ${phone}`,
-          transaction: { type: 'data', amount: numericAmount, phone: phone, network: network, plan: plan }
-        });
+    if (currentBalance < transactionAmount) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: 'Insufficient wallet balance.' });
+    }
 
-    } catch (e) {
-        await client.query('ROLLBACK');
-        throw e;
-    } finally {
-        client.release();
+    // 3. Process Transaction (Simulation)
+    // In a real app, this is where you'd call a third-party API (e.g., VTU provider)
+    const success = Math.random() > 0.1; // Simulate a 90% success rate
+
+    if (success) {
+      const newBalance = currentBalance - transactionAmount;
+
+      // 4. Update Wallet Balance
+      await client.query(
+        'UPDATE wallets SET balance = $1, updated_at = CURRENT_TIMESTAMP WHERE user_id = $2',
+        [newBalance, req.user.id]
+      );
+
+      // 5. Record Transaction
+      const transactionDetails = { phone_number, network, status: 'Success' };
+      await client.query(
+        `INSERT INTO transactions (user_id, type, service_type, amount, details)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [req.user.id, 'Debit', 'Airtime Purchase', transactionAmount, transactionDetails]
+      );
+      
+      // 6. Send Push Notification
+      if (user.fcm_token) {
+          sendPushNotification(user.fcm_token, 'Airtime Purchased!', `You successfully bought ₦${transactionAmount} for ${phone_number}.`);
+      }
+
+
+      await client.query('COMMIT');
+      res.json({
+        success: true,
+        message: `Successfully purchased ₦${transactionAmount} airtime for ${phone_number}.`,
+        new_balance: newBalance,
+      });
+    } else {
+      // Simulation of a third-party failure
+      await client.query('ROLLBACK');
+      res.status(503).json({ success: false, message: 'Service provider error. Transaction failed.' });
     }
 
   } catch (error) {
-    console.error('Data purchase error:', error);
-    res.status(500).json({ success: false, message: 'Internal server error' });
+    await client.query('ROLLBACK');
+    console.error('Airtime transaction error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error during transaction.' });
+  } finally {
+    client.release();
   }
 });
 
 
-// --- Admin Endpoints ---
-const adminRouter = express.Router();
+// --- ADMIN ROUTES ---
 
-// 5A. ADMIN LOGIN
-adminRouter.post('/login', async (req, res) => {
-    try {
-        const { password } = req.body;
-        if (password === process.env.ADMIN_PASSWORD) {
-            const token = jwt.sign(
-                { admin: true, iat: Math.floor(Date.now() / 1000) },
-                process.env.JWT_SECRET,
-                { expiresIn: '8h' }
-            );
-            return res.json({ success: true, message: 'Admin login successful', token });
-        } else {
-            return res.status(401).json({ success: false, message: 'Invalid admin password' });
-        }
-    } catch (error) {
-        console.error('Admin login error:', error);
-        res.status(500).json({ success: false, message: 'Internal server error' });
+app.post('/api/admin/login', async (req, res) => {
+    const { password } = req.body;
+
+    if (password === ADMIN_PASSWORD) {
+        const token = jwt.sign({ role: 'admin' }, process.env.JWT_SECRET, { expiresIn: '1h' });
+        return res.json({ success: true, message: 'Admin login successful.', token: token });
     }
+
+    res.status(401).json({ success: false, message: 'Invalid admin password.' });
 });
 
-// 3A. ADMIN: GENERATE REFERRAL CODES
-adminRouter.post('/referral-codes', adminAuth, async (req, res) => {
-    try {
-        const { discountPercentage } = req.body;
-        if (discountPercentage !== 5 && discountPercentage !== 10) {
-            return res.status(400).json({ success: false, message: 'Discount must be 5 or 10' });
-        }
-
-        const code = "QT" + discountPercentage + "-" + crypto.randomBytes(3).toString('hex').toUpperCase();
-
-        const result = await pool.query(
-            `INSERT INTO referral_codes (code, discount_percentage, is_single_use)
-             VALUES ($1, $2, true)
-             RETURNING code`,
-            [code, discountPercentage]
-        );
-
-        res.status(201).json({ success: true, code: result.rows[0].code });
-
-    } catch (error) {
-        console.error('Generate referral error:', error);
-        res.status(500).json({ success: false, message: 'Internal server error' });
+app.post('/api/admin/referral-codes', authenticateToken, authorizeAdmin, async (req, res) => {
+    const { code, discount_percentage, max_uses, expiry_date, min_transaction } = req.body;
+    
+    if (!code || !discount_percentage) {
+        return res.status(400).json({ success: false, message: 'Code and discount_percentage are required.' });
     }
-});
-
-// 5B. ADMIN: SEND NOTIFICATIONS
-adminRouter.post('/notifications', adminAuth, async (req, res) => {
+    
     try {
-        const { title, body, targetUser } = req.body; // targetUser from admin.html
-        if (!title || !body) {
-            return res.status(400).json({ success: false, message: 'Title and body are required' });
-        }
-
-        // 1. Store notification in DB
-        // We store one notification for *all* users (null target_user_id)
-        // The app will fetch this. A real system would be more complex.
         await pool.query(
-            'INSERT INTO notifications (title, body) VALUES ($1, $2)',
-            [title, body]
+            `INSERT INTO referral_codes (code, discount_percentage, max_uses, expiry_date, min_transaction)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [code, discount_percentage, max_uses || null, expiry_date || null, min_transaction || 0]
         );
+        
+        res.status(201).json({ success: true, message: `Referral code ${code} created successfully.` });
 
-        // 2. Send push notification via FCM
+    } catch (error) {
+        if (error.code === '23505') { // PostgreSQL unique violation error
+            return res.status(409).json({ success: false, message: 'Referral code already exists.' });
+        }
+        console.error('Admin create referral error:', error);
+        res.status(500).json({ success: false, message: 'Internal server error' });
+    }
+});
+
+app.post('/api/admin/notifications', authenticateToken, authorizeAdmin, async (req, res) => {
+    const { title, body, target_user_id } = req.body;
+
+    if (!title || !body) {
+        return res.status(400).json({ success: false, message: 'Notification title and body are required.' });
+    }
+    
+    if (!firebaseAdminInitialized) {
+        return res.status(503).json({ success: false, message: 'Push notifications service is not active (Firebase Admin SDK not initialized).' });
+    }
+
+    try {
+        let tokens;
+        if (target_user_id) {
+            // Send to a single user
+            const result = await pool.query('SELECT fcm_token FROM users WHERE id = $1 AND fcm_token IS NOT NULL', [target_user_id]);
+            tokens = result.rows.map(row => row.fcm_token);
+            if (tokens.length === 0) {
+                 return res.status(404).json({ success: false, message: `User with ID ${target_user_id} not found or has no FCM token.` });
+            }
+        } else {
+            // Send to all users
+            const result = await pool.query('SELECT fcm_token FROM users WHERE fcm_token IS NOT NULL');
+            tokens = result.rows.map(row => row.fcm_token);
+        }
+
+        if (tokens.length === 0) {
+            return res.status(404).json({ success: false, message: 'No valid FCM tokens found for the target audience.' });
+        }
+
         const message = {
             notification: { title, body },
-            topic: 'all_users' // Assumes all users are subscribed to this topic
+            tokens: tokens, // Use sendMulticast for multiple tokens
         };
-
-        try {
-            const response = await admin.messaging().send(message);
-            console.log('FCM message sent:', response);
-            res.json({ success: true, message: 'Notification sent and stored successfully.' });
-        } catch (fcmError) {
-            console.error('FCM send error:', fcmError);
-            res.status(500).json({ success: false, message: 'Failed to send push notification. Check Firebase Admin config.' });
-        }
+        
+        const response = await admin.messaging().sendEachForMulticast(message);
+        
+        res.json({ 
+            success: true, 
+            message: `Successfully sent notification to ${response.successCount} of ${tokens.length} users.`,
+            response: response
+        });
 
     } catch (error) {
-        console.error('Send notification error:', error);
+        console.error('Admin notification error:', error);
         res.status(500).json({ success: false, message: 'Internal server error' });
     }
 });
 
-// GET NOTIFICATIONS (for the app)
-app.get('/api/notifications', authenticateToken, async (req, res) => {
-    try {
-        // Fetches global notifications (target_user_id IS NULL)
-        const result = await pool.query(
-            `SELECT id, title, body, created_at, is_read 
-             FROM notifications
-             WHERE target_user_id IS NULL
-             ORDER BY created_at DESC
-             LIMIT 15`
-            // In a real app, you'd also fetch user-specific notifications
-            // AND (target_user_id = $1 OR target_user_id IS NULL)
-        );
+// --- ERROR HANDLERS ---
 
-        // This is a simplified version. `is_read` would be per-user.
-        res.json({ success: true, notifications: result.rows });
-    } catch (error) {
-        console.error('Get notifications error:', error);
-        res.status(500).json({ success: false, message: 'Internal server error' });
-    }
-});
-
-// Mount the admin router
-app.use('/api/admin', adminRouter);
-
-
-// --- Error Handlers ---
+// 404 handler - MUST BE LAST BEFORE GLOBAL HANDLER
 app.use('*', (req, res) => {
-  res.status(404).json({ success: false, message: 'API endpoint not found' });
+  console.log('❌ Route not found:', req.originalUrl);
+  res.status(404).json({
+    success: false,
+    message: 'API endpoint not found',
+    requested: req.originalUrl
+  });
 });
 
+// Global error handler
 app.use((error, req, res, next) => {
   console.error('🚨 Unhandled error:', error);
-  res.status(500).json({ success: false, message: 'Internal server error' });
+  res.status(500).json({
+    success: false,
+    message: 'Internal server error'
+  });
 });
 
-// --- Start Server ---
+// Initialize database and start server
 const startServer = async () => {
   try {
-    // Database initialization is now done by `init-db.js` via render.yaml
+    // This calls the initializeDatabase function from init-db.js
+    // It will create/update tables, including the new ones (is_verified, verification_code, pin_hash, fcm_token, referral_code, referral_codes)
+    await initializeDatabase(pool); 
     
     const PORT = process.env.PORT || 10000;
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`🚀 QuickTop Server running on port ${PORT}`);
       console.log(`📊 Environment: ${process.env.NODE_ENV}`);
-      console.log(`🔗 Base URL: http://localhost:${PORT}`);
     });
   } catch (error) {
-    console.error('❌ Failed to start server:', error);
+    console.error('Server failed to start:', error);
     process.exit(1);
   }
 };
 
 startServer();
+
+// End of server.js
