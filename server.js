@@ -12,7 +12,7 @@ const path = require('path');
 require('dotenv').config();
 
 // ⚡ FIX 1: Import the function via named destructuring { initDatabase }
-const initDatabase = require('./init-db');
+const { initDatabase } = require('./init-db');
 
 const app = express();
 
