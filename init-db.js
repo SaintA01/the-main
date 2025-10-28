@@ -114,4 +114,4 @@ const initDatabase = async () => {
   }
 };
 
-initDatabase();
+module.exports = { initDatabase };
